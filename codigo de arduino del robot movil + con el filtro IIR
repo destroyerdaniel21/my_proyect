@@ -1,0 +1,167 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// --- PINES DE CONTROL (TB6612FNG) ---
+const int PWMA = 25; 
+const int AIN1 = 26; 
+const int AIN2 = 27; 
+
+const int PWMB = 14; 
+const int BIN1 = 32; 
+const int BIN2 = 33; 
+
+// Pin de Standby
+const int STBY = 13; 
+
+const int freq = 30000;
+const int resolution = 8;
+int velocidadBase = 220; // Velocidad máxima (0-255)
+
+// --- VARIABLES DEL FILTRO ANTI-DERRAPE ---
+int objetivoPWMA = 0;
+int objetivoPWMB = 0;
+float actualPWMA = 0;
+float actualPWMB = 0;
+const float ALFA_ACELERACION = 0.05; 
+
+// --- VARIABLES PARA EL SERIAL PLOTTER ---
+unsigned long tiempoAnteriorPlotter = 0;
+const int intervaloPlotter = 50; // Enviar datos cada 50ms para la gráfica
+
+// --- DECLARACIÓN DE PROTOTIPOS ---
+void configurarDireccion(bool adelanteIzq, bool adelanteDer);
+void establecerObjetivos(int velA, int velB);
+void aplicarFiltroMotor();
+
+// --- CONFIGURACIÓN BLE ---
+BLEServer *pServer = NULL;
+bool deviceConnected = false;
+
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      establecerObjetivos(0, 0); // Frenar si se desconecta
+      pServer->startAdvertising(); 
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue(); 
+      
+      if (rxValue.length() > 0) {
+        char comando = rxValue[0];
+        if (comando == '\n' || comando == '\r') return;
+
+        // --- LÓGICA DE MOVIMIENTO DESDE LA WEB ---
+        if (comando == 'A' || comando == 'a' || comando == 'F' || comando == 'f') {
+          configurarDireccion(true, true);
+          establecerObjetivos(velocidadBase, velocidadBase);
+        }
+        else if (comando == 'R' || comando == 'r' || comando == 'B' || comando == 'b') {
+          configurarDireccion(false, false);
+          establecerObjetivos(velocidadBase, velocidadBase);
+        }
+        else if (comando == 'D' || comando == 'd') {
+          configurarDireccion(true, false); 
+          establecerObjetivos(velocidadBase, velocidadBase);
+        }
+        else if (comando == 'I' || comando == 'i') {
+          configurarDireccion(false, true); 
+          establecerObjetivos(velocidadBase, velocidadBase);
+        }
+        else if (comando == 'S' || comando == 's') {
+          establecerObjetivos(0, 0);
+        }
+        else if (comando >= '0' && comando <= '9') {
+          int nivel = comando - '0';
+          velocidadBase = map(nivel, 0, 9, 100, 255);
+        }
+      }
+    }
+};
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configurar los pines
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+
+  ledcAttach(PWMA, freq, resolution);
+  ledcAttach(PWMB, freq, resolution);
+  establecerObjetivos(0, 0);
+
+  // Inicializar Bluetooth
+  BLEDevice::init("robotdinho_02");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  BLECharacteristic *pCharacteristic = pService->createCharacteristic(
+                                         CHARACTERISTIC_UUID_RX,
+                                         BLECharacteristic::PROPERTY_WRITE | 
+                                         BLECharacteristic::PROPERTY_WRITE_NR
+                                       );
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  
+  // Imprimir encabezados para que el Serial Plotter los reconozca como leyendas
+  Serial.println("ObjetivoIzquierdo,ActualIzquierdo");
+}
+
+void loop() {
+  // 1. Ejecutar el filtro exponencial matemáticamente de forma continua
+  aplicarFiltroMotor();
+  
+  // 2. Enviar datos al Serial Plotter (Solo motor izquierdo para claridad visual)
+  if (millis() - tiempoAnteriorPlotter >= intervaloPlotter) {
+    tiempoAnteriorPlotter = millis();
+    Serial.print("Objetivo:");
+    Serial.print(objetivoPWMA);
+    Serial.print(",");
+    Serial.print("Filtrado:");
+    Serial.println(actualPWMA);
+  }
+  
+  delay(10); 
+}
+
+// --- FUNCIONES INTERNAS DEL CONTROL ---
+void configurarDireccion(bool adelanteIzq, bool adelanteDer) {
+  digitalWrite(AIN1, adelanteIzq ? HIGH : LOW);
+  digitalWrite(AIN2, adelanteIzq ? LOW : HIGH);
+  digitalWrite(BIN1, adelanteDer ? HIGH : LOW);
+  digitalWrite(BIN2, adelanteDer ? LOW : HIGH);
+}
+
+void establecerObjetivos(int velA, int velB) {
+  objetivoPWMA = velA;
+  objetivoPWMB = velB;
+}
+
+void aplicarFiltroMotor() {
+  actualPWMA = (ALFA_ACELERACION * objetivoPWMA) + ((1.0 - ALFA_ACELERACION) * actualPWMA);
+  actualPWMB = (ALFA_ACELERACION * objetivoPWMB) + ((1.0 - ALFA_ACELERACION) * actualPWMB);
+
+  ledcWrite(PWMA, (int)actualPWMA);
+  ledcWrite(PWMB, (int)actualPWMB);
+}
